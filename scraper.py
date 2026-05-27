@@ -270,24 +270,68 @@ def scrape_halooglasi(config):
 # ============================================================
 
 def scrape_4zida(config):
+    """
+    Dohvati sve stanove na prodaju u Beogradu.
+    Koristimo cityId=1 umesto placeIds[] koji vraća 422.
+    Filtriranje po lokaciji se radi naknadno u main().
+    """
     results = []
+    api_url = (
+        "https://api.4zida.rs/v6/search/apartments"
+        "?for=sale&cityId=1&sort=-createdAt&page=1&limit=60"
+    )
+    logger.info(f"[4zida.rs] {api_url}")
+    try:
+        data = fetch_json(api_url)
+        ads = data.get('ads', data.get('results', data if isinstance(data, list) else []))
+        logger.info(f"[4zida.rs] Beograd: {len(ads)} oglasa")
 
-    place_configs = [
-        (638, 'Novi Beograd'),
-        (630, 'Zemun'),
-    ]
+        for ad in ads:
+            try:
+                ad_id = str(ad.get('id', ''))
+                listing_id = f"4zida_{ad_id}"
 
-    for place_id, location_name in place_configs:
-        # Koristimo urllib direktno — requests re-enkodira [] u %5B%5D što API ne prihvata
-        api_url = (
-            f"https://api.4zida.rs/v6/search/apartments"
-            f"?for=sale&placeIds[]={place_id}&sort=-createdAt&page=1&limit=40"
-        )
-        logger.info(f"[4zida.rs] {api_url}")
-        try:
-            data = fetch_json(api_url)
-            ads = data.get('ads', data.get('results', data if isinstance(data, list) else []))
-            logger.info(f"[4zida.rs] {location_name}: {len(ads)} oglasa")
+                price = ad.get('price') or ad.get('totalPrice')
+                area = ad.get('m2') or ad.get('size')
+
+                addr = ad.get('address', {}) or {}
+                city_part = addr.get('cityPart', {}) or {}
+                street = addr.get('street', {}) or {}
+                nb_name = city_part.get('name', '') if isinstance(city_part, dict) else ''
+                st_name = street.get('name', '') if isinstance(street, dict) else ''
+                location_str = f"{nb_name}, {st_name}".strip(', ') or 'Beograd'
+
+                structure = ad.get('structure', {}) or {}
+                rooms = structure.get('name', '') if isinstance(structure, dict) else str(structure)
+
+                ppm2 = calc_ppm2(price, area)
+
+                slug = ad.get('slug', '') or ad.get('url', '')
+                full_url = (
+                    f"https://4zida.rs/{slug}" if slug and not slug.startswith('http')
+                    else slug or f"https://4zida.rs/stan-na-prodaju/{ad_id}"
+                )
+
+                title = ad.get('title') or f"Stan {area}m² – {nb_name or 'Beograd'}"
+
+                results.append({
+                    'id': listing_id,
+                    'title': title,
+                    'location': location_str,
+                    'price': price,
+                    'area': area,
+                    'price_per_m2': ppm2,
+                    'url': full_url,
+                    'source': '4zida.rs',
+                    'rooms': rooms,
+                })
+            except Exception as e:
+                logger.debug(f"[4zida.rs] oglas greška: {e}")
+
+    except Exception as e:
+        logger.error(f"[4zida.rs] API greška: {e}")
+
+    return results
 
             for ad in ads:
                 try:
@@ -343,70 +387,62 @@ def scrape_4zida(config):
 # ============================================================
 
 def scrape_cityexpert(config):
+    """
+    Dohvati stanove na prodaju u Beogradu bez filtera po opštini.
+    Izbegavamo municipalities[] koji vraća 500 grešku.
+    """
     results = []
+    api_url = (
+        "https://cityexpert.rs/api/Search/"
+        "?ptId=1&cityId=1&rentOrSale=s&currentPage=1&resultsPerPage=60&sort=datedesc"
+    )
+    logger.info(f"[City Expert] {api_url}")
+    try:
+        data = fetch_json(api_url, extra_headers={'Referer': 'https://cityexpert.rs/'})
+        ads = data.get('result', data.get('results', data.get('data', [])))
+        logger.info(f"[City Expert] Beograd: {len(ads)} oglasa")
 
-    # Municipality IDs: Novi Beograd = 7, Zemun = 16
-    municipalities = [
-        (7, 'Novi Beograd'),
-        (16, 'Zemun'),
-    ]
+        for ad in ads:
+            try:
+                prop_id = str(ad.get('propId', ad.get('id', '')))
+                listing_id = f"ce_{prop_id}"
 
-    for mun_id, location_name in municipalities:
-        # Pokušaj novi API format
-        api_url = (
-            f"https://cityexpert.rs/api/Search/"
-            f"?ptId=1&cityId=1&rentOrSale=s&currentPage=1"
-            f"&resultsPerPage=50&sort=datedesc&municipality={mun_id}"
-        )
-        logger.info(f"[City Expert] municipalityId={mun_id}")
-        try:
-            data = fetch_json(api_url, extra_headers={'Referer': 'https://cityexpert.rs/'})
-            ads = data.get('result', data.get('results', data.get('data', [])))
-            logger.info(f"[City Expert] {location_name}: {len(ads)} oglasa")
+                price = ad.get('price') or ad.get('totalPrice')
+                area = ad.get('size') or ad.get('m2')
 
-            for ad in ads:
-                try:
-                    prop_id = str(ad.get('propId', ad.get('id', '')))
-                    listing_id = f"ce_{prop_id}"
+                mun_info = ad.get('municipality', {}) or {}
+                mun_name = mun_info.get('title', '') if isinstance(mun_info, dict) else str(mun_info)
+                micro = ad.get('microlocation', {}) or {}
+                micro_name = micro.get('title', '') if isinstance(micro, dict) else ''
+                street = ad.get('street', '') or ''
+                location_str = ', '.join(filter(None, [mun_name, micro_name, street])) or 'Beograd'
 
-                    price = ad.get('price') or ad.get('totalPrice')
-                    area = ad.get('size') or ad.get('m2')
+                structure = str(ad.get('structure', '') or '')
+                slug = ad.get('slug', '') or ''
+                full_url = (
+                    f"https://cityexpert.rs/prodaja/{slug}" if slug
+                    else f"https://cityexpert.rs/prodaja/stan-{prop_id}"
+                )
 
-                    mun_info = ad.get('municipality', {}) or {}
-                    mun_name = mun_info.get('title', location_name) if isinstance(mun_info, dict) else location_name
-                    micro = ad.get('microlocation', {}) or {}
-                    micro_name = micro.get('title', '') if isinstance(micro, dict) else ''
-                    street = ad.get('street', '') or ''
-                    location_str = ', '.join(filter(None, [mun_name, micro_name, street]))
+                ppm2 = calc_ppm2(price, area)
+                title = f"Stan {area}m² – {mun_name or 'Beograd'}"
 
-                    structure = str(ad.get('structure', '') or '')
-                    slug = ad.get('slug', '') or ''
-                    full_url = (
-                        f"https://cityexpert.rs/prodaja/{slug}" if slug
-                        else f"https://cityexpert.rs/prodaja/stan-{prop_id}"
-                    )
+                results.append({
+                    'id': listing_id,
+                    'title': title,
+                    'location': location_str,
+                    'price': price,
+                    'area': area,
+                    'price_per_m2': ppm2,
+                    'url': full_url,
+                    'source': 'City Expert',
+                    'rooms': structure,
+                })
+            except Exception as e:
+                logger.debug(f"[City Expert] oglas greška: {e}")
 
-                    ppm2 = calc_ppm2(price, area)
-                    title = f"Stan {area}m² – {mun_name}"
-
-                    results.append({
-                        'id': listing_id,
-                        'title': title,
-                        'location': location_str,
-                        'price': price,
-                        'area': area,
-                        'price_per_m2': ppm2,
-                        'url': full_url,
-                        'source': 'City Expert',
-                        'rooms': structure,
-                    })
-                except Exception as e:
-                    logger.debug(f"[City Expert] oglas greška: {e}")
-
-        except Exception as e:
-            logger.error(f"[City Expert] API greška za mun {mun_id}: {e}")
-
-        time.sleep(2)
+    except Exception as e:
+        logger.error(f"[City Expert] API greška: {e}")
 
     return results
 
@@ -438,7 +474,7 @@ def main():
     logger.info(f"👁️  Već viđeno: {len(seen)} oglasa")
 
     scrapers = [
-        ('Halo Oglasi', scrape_halooglasi),
+        # Halo Oglasi je uklonjen — blokira GitHub Actions IP (403)
         ('4zida.rs', scrape_4zida),
         ('City Expert', scrape_cityexpert),
     ]
