@@ -41,6 +41,11 @@ HEADERS = {
 # Na GitHub Actions ovo nema efekta (tamo SSL radi normalno)
 SSL_VERIFY = False
 
+# Zaobiđi lokalni proxy (antivirus/korporativni) koji blokira HTTPS tunel
+# Ovo ne utiče na GitHub Actions gde nema proxy-ja
+os.environ['NO_PROXY'] = '*'
+os.environ['no_proxy'] = '*'
+
 # ============================================================
 # CONFIG & STATE
 # ============================================================
@@ -90,7 +95,8 @@ def send_telegram(token, chat_id, message):
         'disable_web_page_preview': False,
     }
     try:
-        r = requests.post(url, data=data, timeout=10, verify=SSL_VERIFY)
+        r = requests.post(url, data=data, timeout=10, verify=SSL_VERIFY,
+                          proxies={'http': '', 'https': ''})
         r.raise_for_status()
         logger.info("✅ Telegram poruka poslata")
         return True
@@ -171,13 +177,22 @@ def is_good_price(ppm2, max_ppm2):
     return ppm2 is not None and ppm2 <= max_ppm2
 
 def fetch_json(url, extra_headers=None):
-    """Fetch JSON bez URL re-encodinga (fix za 4zida [] problem)."""
+    """Fetch JSON bez URL re-encodinga i bez proxy-ja (fix za lokalni antivirus intercept)."""
+    import ssl
     headers = {**HEADERS, 'Accept': 'application/json'}
     if extra_headers:
         headers.update(extra_headers)
     req = urllib.request.Request(url, headers=headers)
+    # SSL context koji ignoriše certifikate
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    # Eksplicitno zaobiđi proxy — ProxyHandler({}) = bez proxy-ja
+    proxy_handler = urllib.request.ProxyHandler({})
+    https_handler = urllib.request.HTTPSHandler(context=ctx)
+    opener = urllib.request.build_opener(proxy_handler, https_handler)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with opener.open(req, timeout=20) as resp:
             return json.loads(resp.read().decode('utf-8'))
     except Exception as e:
         raise Exception(f"fetch_json greška: {e}")
@@ -196,6 +211,7 @@ HALO_LOCATION_SLUGS = [
 def scrape_halooglasi(config):
     results = []
     session = requests.Session()
+    session.trust_env = False  # zaobiđi proxy iz env varijabli
     session.headers.update({
         **HEADERS,
         'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -271,95 +287,58 @@ def scrape_halooglasi(config):
 
 def scrape_4zida(config):
     """
-    Dohvati sve stanove na prodaju u Beogradu.
-    Koristimo cityId=1 umesto placeIds[] koji vraća 422.
-    Filtriranje po lokaciji se radi naknadno u main().
+    Dohvati stanove na prodaju iz 4zida.rs API-ja.
+    API ne prihvata filtere (vraća 422) — koristimo ?limit=60&page=N
+    i filtriramo u Pythonu po: for==sale, placeNames, pricePerM2.
     """
     results = []
-    api_url = (
-        "https://api.4zida.rs/v6/search/apartments"
-        "?for=sale&cityId=1&sort=-createdAt&page=1&limit=60"
-    )
-    logger.info(f"[4zida.rs] {api_url}")
-    try:
-        data = fetch_json(api_url)
-        ads = data.get('ads', data.get('results', data if isinstance(data, list) else []))
-        logger.info(f"[4zida.rs] Beograd: {len(ads)} oglasa")
+    targets = config.get('target_locations', ['Novi Beograd', 'Zemun', 'Ledine', 'Bezanija'])
+    max_ppm2 = int(config.get('max_price_per_m2', 1500))
 
-        for ad in ads:
-            try:
-                ad_id = str(ad.get('id', ''))
-                listing_id = f"4zida_{ad_id}"
+    for page in range(1, 6):  # max 5 strana = 300 oglasa
+        api_url = f"https://api.4zida.rs/v6/search/apartments?limit=60&page={page}"
+        logger.info(f"[4zida.rs] strana {page}: {api_url}")
+        try:
+            data = fetch_json(api_url)
+            ads = data.get('ads', [])
+            if not ads:
+                logger.info(f"[4zida.rs] strana {page}: nema više oglasa, stajemo")
+                break
 
-                price = ad.get('price') or ad.get('totalPrice')
-                area = ad.get('m2') or ad.get('size')
-
-                addr = ad.get('address', {}) or {}
-                city_part = addr.get('cityPart', {}) or {}
-                street = addr.get('street', {}) or {}
-                nb_name = city_part.get('name', '') if isinstance(city_part, dict) else ''
-                st_name = street.get('name', '') if isinstance(street, dict) else ''
-                location_str = f"{nb_name}, {st_name}".strip(', ') or 'Beograd'
-
-                structure = ad.get('structure', {}) or {}
-                rooms = structure.get('name', '') if isinstance(structure, dict) else str(structure)
-
-                ppm2 = calc_ppm2(price, area)
-
-                slug = ad.get('slug', '') or ad.get('url', '')
-                full_url = (
-                    f"https://4zida.rs/{slug}" if slug and not slug.startswith('http')
-                    else slug or f"https://4zida.rs/stan-na-prodaju/{ad_id}"
-                )
-
-                title = ad.get('title') or f"Stan {area}m² – {nb_name or 'Beograd'}"
-
-                results.append({
-                    'id': listing_id,
-                    'title': title,
-                    'location': location_str,
-                    'price': price,
-                    'area': area,
-                    'price_per_m2': ppm2,
-                    'url': full_url,
-                    'source': '4zida.rs',
-                    'rooms': rooms,
-                })
-            except Exception as e:
-                logger.debug(f"[4zida.rs] oglas greška: {e}")
-
-    except Exception as e:
-        logger.error(f"[4zida.rs] API greška: {e}")
-
-    return results
+            logger.info(f"[4zida.rs] strana {page}: {len(ads)} oglasa")
 
             for ad in ads:
                 try:
+                    # Samo prodaja
+                    if ad.get('for') != 'sale':
+                        continue
+
+                    # Lokacija — placeNames je array npr. ["Ledine", "Novi Beograd", "Beograd"]
+                    place_names = ad.get('placeNames', [])
+                    location_str = ', '.join(place_names) if place_names else 'Beograd'
+
+                    # Proveri da li je u traženim lokacijama
+                    if not any(t.lower() in pn.lower() for t in targets for pn in place_names):
+                        continue
+
                     ad_id = str(ad.get('id', ''))
                     listing_id = f"4zida_{ad_id}"
 
-                    price = ad.get('price') or ad.get('totalPrice')
-                    area = ad.get('m2') or ad.get('size')
+                    price = ad.get('price')
+                    area = ad.get('m2')
 
-                    addr = ad.get('address', {}) or {}
-                    city_part = addr.get('cityPart', {}) or {}
-                    street = addr.get('street', {}) or {}
-                    nb_name = city_part.get('name', location_name) if isinstance(city_part, dict) else location_name
-                    st_name = street.get('name', '') if isinstance(street, dict) else ''
-                    location_str = f"{nb_name}, {st_name}".strip(', ')
+                    # API već računa pricePerM2 — koristimo direktno
+                    ppm2 = ad.get('pricePerM2') or calc_ppm2(price, area)
 
-                    structure = ad.get('structure', {}) or {}
-                    rooms = structure.get('name', '') if isinstance(structure, dict) else str(structure)
-
-                    ppm2 = calc_ppm2(price, area)
-
-                    slug = ad.get('slug', '') or ad.get('url', '')
+                    url_path = ad.get('urlPath', '')
                     full_url = (
-                        f"https://4zida.rs/{slug}" if slug and not slug.startswith('http')
-                        else slug or f"https://4zida.rs/stan-na-prodaju/{ad_id}"
+                        f"https://4zida.rs{url_path}" if url_path and url_path.startswith('/')
+                        else f"https://4zida.rs/{url_path}" if url_path
+                        else f"https://4zida.rs/stan-na-prodaju/{ad_id}"
                     )
 
-                    title = ad.get('title') or f"Stan {area}m² – {nb_name}"
+                    rooms = ad.get('structureName', '') or ''
+                    title = ad.get('detailedTitle') or ad.get('title') or f"Stan {area}m² – {place_names[0] if place_names else 'Beograd'}"
 
                     results.append({
                         'id': listing_id,
@@ -376,10 +355,12 @@ def scrape_4zida(config):
                     logger.debug(f"[4zida.rs] oglas greška: {e}")
 
         except Exception as e:
-            logger.error(f"[4zida.rs] API greška za placeId {place_id}: {e}")
+            logger.error(f"[4zida.rs] API greška strana {page}: {e}")
+            break
 
-        time.sleep(2)
+        time.sleep(1)
 
+    logger.info(f"[4zida.rs] Ukupno u traženim lokacijama: {len(results)}")
     return results
 
 # ============================================================
@@ -579,7 +560,7 @@ if __name__ == '__main__':
         if not matches:
             print("\nNema oglasa koji prolaze filter. Distribucija cena/m²:")
             loc_listings = [l for l in all_listings if is_target_location(l.get('location', ''), targets)]
-            print(f"  Oglasi u traženim lokacijama: {len(loc_listings)}")
+            print(f"  Oglasi u tražnim lokacijama: {len(loc_listings)}")
             prices = [l['price_per_m2'] for l in loc_listings if l.get('price_per_m2')]
             if prices:
                 print(f"  Min: {min(prices):.0f}€/m² | Max: {max(prices):.0f}€/m² | Prosek: {sum(prices)/len(prices):.0f}€/m²")
