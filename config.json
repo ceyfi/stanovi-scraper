@@ -1,7 +1,7 @@
 {
   "telegram_token": "8988880041:AAFWAPBmqf0mm0c9m97ZgNajqE7UrsHaC6U",
   "telegram_chat_id": "6304760850",
-  "max_price_per_m2": 1500,
+  "max_price_per_m2": 2000,
   "target_locations": [
     "Novi Beograd",
     "Zemun",

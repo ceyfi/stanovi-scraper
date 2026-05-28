@@ -34,7 +34,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MAX_PRICE_PER_M2: '1500'
+          MAX_PRICE_PER_M2: '2000'
         run: python scraper.py
 
       - name: Sačuvaj seen.json u repo
