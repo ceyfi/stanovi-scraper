@@ -42,10 +42,15 @@ jobs:
         run: python scraper.py
 
       - name: Sačuvaj seen.json u repo
+        continue-on-error: true   # Push greška ne ubija workflow — scraping je uspeo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
-          git add seen.json
-          git diff --staged --quiet || git commit -m "chore: update seen.json [skip ci]"
-          git push
+          for attempt in 1 2 3; do
+            git pull --rebase origin main
+            git add seen.json
+            git diff --staged --quiet || git commit -m "chore: update seen.json [skip ci]"
+            git push && break
+            echo "Push attempt $attempt failed, retrying in 5s..."
+            sleep 5
+          done
