@@ -67,6 +67,10 @@ def load_config():
             config['telegram_token'] = os.environ['TELEGRAM_TOKEN']
         if os.environ.get('TELEGRAM_CHAT_ID'):
             config['telegram_chat_id'] = os.environ['TELEGRAM_CHAT_ID']
+        if os.environ.get('TELEGRAM_EXTRA_CHAT_IDS'):
+            # Može biti više ID-ova razdvojenih zarezom: "123,456"
+            extra = [x.strip() for x in os.environ['TELEGRAM_EXTRA_CHAT_IDS'].split(',') if x.strip()]
+            config['telegram_extra_chat_ids'] = extra
     return config
 
 def load_seen():
