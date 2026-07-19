@@ -20,13 +20,14 @@ jobs:
       contents: write   # Potrebno da bi mogao da commituje seen.json
 
     steps:
+      # v5/v6: starije verzije rade na Node 20 koji je deprecated na Actions runnerima
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Podesi Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -34,12 +35,14 @@ jobs:
       - name: Instaliraj zavisnosti
         run: pip install -r requirements.txt
 
+      # MAX_PRICE_PER_M2 je namerno izbačen — config.json ga uvek pregazi
+      # (load_config prvo uzme env, pa ga config.update(file_config) prepiše),
+      # pa je samo zbunjivao. Limite menjaj u config.json.
       - name: Pokreni scraper
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_EXTRA_CHAT_IDS: ${{ secrets.TELEGRAM_EXTRA_CHAT_IDS }}
-          MAX_PRICE_PER_M2: '2000'
         run: python scraper.py
 
       - name: Sačuvaj seen.json u repo

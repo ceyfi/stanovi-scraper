@@ -456,7 +456,6 @@ def scrape_4zida(config):
     """
     results = []
     targets = config.get('target_locations', ['Novi Beograd', 'Zemun', 'Ledine', 'Bezanija'])
-    max_ppm2 = int(config.get('max_price_per_m2', 1500))
 
     # Probaj različite URL formate — API menja šta prima
     url_candidates = [
@@ -466,6 +465,7 @@ def scrape_4zida(config):
     ]
 
     working_url = None
+    first_page_data = None  # čuvamo odgovor iz probe da ne tražimo stranu 1 dva puta
     for candidate in url_candidates:
         logger.info(f"[4zida.rs] Testiram URL: {candidate}")
         try:
@@ -476,6 +476,7 @@ def scrape_4zida(config):
             })
             if isinstance(test_data, dict) or isinstance(test_data, list):
                 working_url = candidate
+                first_page_data = test_data
                 logger.info(f"[4zida.rs] Radi URL: {candidate}")
                 break
         except Exception as e:
@@ -494,11 +495,14 @@ def scrape_4zida(config):
             api_url = f"{working_url}{sep}page={page}"
         logger.info(f"[4zida.rs] strana {page}: {api_url}")
         try:
-            data = fetch_json(api_url, extra_headers={
-                'Accept': 'application/json, text/plain, */*',
-                'Origin': 'https://4zida.rs',
-                'Referer': 'https://4zida.rs/',
-            })
+            if page == 1 and first_page_data is not None:
+                data = first_page_data  # reuse iz probe, bez dodatnog HTTP zahteva
+            else:
+                data = fetch_json(api_url, extra_headers={
+                    'Accept': 'application/json, text/plain, */*',
+                    'Origin': 'https://4zida.rs',
+                    'Referer': 'https://4zida.rs/',
+                })
             ads = data.get('ads', [])
             if not ads:
                 logger.info(f"[4zida.rs] strana {page}: nema više oglasa, stajemo")
@@ -516,8 +520,11 @@ def scrape_4zida(config):
                     place_names = ad.get('placeNames', [])
                     location_str = ', '.join(place_names) if place_names else 'Beograd'
 
-                    # Proveri da li je u traženim lokacijama
-                    if not any(t.lower() in pn.lower() for t in targets for pn in place_names):
+                    # Proveri da li je u traženim lokacijama.
+                    # VAŽNO: koristi is_target_location() (normalizuje dijakritike),
+                    # ne sirovi .lower() — inače 'Bežanija' iz API-ja ne matchuje
+                    # 'Bezanija' iz config-a i oglas tiho nestane pre main() filtera.
+                    if not is_target_location(location_str, targets):
                         continue
 
                     ad_id = str(ad.get('id', ''))
@@ -677,15 +684,26 @@ def scrape_nekretnine(config):
 
         logger.info(f"[Nekretnine.rs] strana {page}: {url}")
         try:
-            r = session.get(url, timeout=20, verify=SSL_VERIFY)
-            if r.status_code != 200:
-                logger.warning(f"[Nekretnine.rs] status {r.status_code}")
+            # Sajt ume da vrati HTTP 103 (Early Hints) koji novije urllib3 verzije
+            # isporuče kao finalni odgovor sa praznim telom. Pokušaj par puta —
+            # sledeći pokušaj obično vrati pravi 200 sa sadržajem.
+            r = None
+            for attempt in range(1, 4):
+                r = session.get(url, timeout=20, verify=SSL_VERIFY)
+                if r.status_code == 200 and r.text:
+                    break
+                logger.warning(f"[Nekretnine.rs] status {r.status_code} (pokušaj {attempt}/3), ponavljam...")
+                time.sleep(2 * attempt)
+
+            if r is None or not r.text:
+                logger.warning("[Nekretnine.rs] prazan odgovor posle 3 pokušaja")
                 break
 
             import re as _re
             m = _re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, _re.DOTALL)
             if not m:
-                logger.warning("[Nekretnine.rs] Nema __NEXT_DATA__")
+                logger.warning(f"[Nekretnine.rs] Nema __NEXT_DATA__ (status {r.status_code}, "
+                               f"{len(r.text)} karaktera) — sajt je verovatno promenio strukturu")
                 break
 
             page_data = json.loads(m.group(1))
@@ -711,8 +729,9 @@ def scrape_nekretnine(config):
                     microzone = location.get('microzone', '')
                     location_str = ', '.join(filter(None, [macrozone, microzone, location.get('city', '')]))
 
-                    # Filter po lokaciji
-                    if not any(t.lower() in location_str.lower() for t in targets):
+                    # Filter po lokaciji — is_target_location normalizuje dijakritike
+                    # (vidi komentar u scrape_4zida)
+                    if not is_target_location(location_str, targets):
                         continue
 
                     # Površina: "114 m²"
@@ -800,7 +819,9 @@ TELEGRAM_CMD_RE = re.compile(r'^/svi(\d+)?\b')
 
 
 def get_telegram_updates(token, offset=None, timeout=30):
-    """Long-poll Telegram getUpdates. Vraća listu update objekata."""
+    """Long-poll Telegram getUpdates. Vraća listu update objekata.
+    Ako Telegram vrati 409 (Conflict), znači da druga instanca već sluša
+    (npr. lokalni --listen dok Actions pokušava) — tada tiho vraćamo praznu listu."""
     url = f"https://api.telegram.org/bot{token}/getUpdates"
     params = {'timeout': timeout}
     if offset is not None:
@@ -808,6 +829,9 @@ def get_telegram_updates(token, offset=None, timeout=30):
     try:
         r = requests.get(url, params=params, timeout=timeout + 10, verify=SSL_VERIFY,
                          proxies={'http': '', 'https': ''})
+        if r.status_code == 409:
+            logger.info("ℹ️  getUpdates 409 — druga instanca (lokalni listener) već sluša, preskačem.")
+            return []
         r.raise_for_status()
         return r.json().get('result', [])
     except Exception as e:
@@ -815,9 +839,11 @@ def get_telegram_updates(token, offset=None, timeout=30):
         return []
 
 
-def handle_svi_command(config, chat_id, telegram_token, override_total=None):
+def handle_svi_command(config, chat_id, telegram_token, override_total=None, prefetched=None):
     """/svi → svi trenutni matches po config filterima (bez seen.json ograničenja).
-    /svi<N> → isto, ali max ukupna cena = N*1000 €, bez ppm2 ograničenja (brzi pregled)."""
+    /svi<N> → isto, ali max ukupna cena = N*1000 €, bez ppm2 ograničenja (brzi pregled).
+    prefetched: već prikupljeni oglasi (main() ih ima posle svog run-a) — tada se
+    ne skrejpuje ponovo, odgovor je trenutan."""
     targets = config.get('target_locations', ['Beograd'])
     if override_total is not None:
         max_total = override_total
@@ -827,9 +853,13 @@ def handle_svi_command(config, chat_id, telegram_token, override_total=None):
         ppm2_cap = int(config.get('max_price_per_m2', 2000))
 
     cena_txt = f" do {max_total:,.0f} €".replace(',', '.') if max_total else ""
-    send_telegram(telegram_token, chat_id, f"🔍 Tražim sve oglase{cena_txt}... (30-60s)")
 
-    all_listings = run_scrapers_collect(config, SCRAPERS_ALL)
+    if prefetched is not None:
+        all_listings = prefetched
+    else:
+        send_telegram(telegram_token, chat_id, f"🔍 Tražim sve oglase{cena_txt}... (30-60s)")
+        all_listings = run_scrapers_collect(config, SCRAPERS_ALL)
+
     matches = [l for l in all_listings if filter_match(l, targets, ppm2_cap, max_total)]
 
     if not matches:
@@ -861,6 +891,64 @@ def handle_svi_command(config, chat_id, telegram_token, override_total=None):
         send_telegram(telegram_token, chat_id, chunk)
 
 
+def get_allowed_chat_ids(config):
+    """Chat ID-ovi kojima je dozvoljeno da šalju komande (glavni + extra iz config-a)."""
+    ids = {str(config.get('telegram_chat_id', ''))}
+    ids.update(str(x) for x in config.get('telegram_extra_chat_ids', []))
+    ids.discard('')
+    return ids
+
+
+def handle_pending_commands(config, prefetched=None):
+    """Jednokratna (bez long-polla) provera neodgovorenih /svi komandi.
+    Poziva se iz main() na GitHub Actions, da komande rade i kad lokalni
+    --listen nije pokrenut (npr. računar ugašen) — odgovor tada stiže
+    na sledećem satnom run-u umesto za par sekundi.
+
+    Nema dupliranja odgovora: Telegram svaki update isporučuje samo jednom,
+    pa ko ga prvi pokupi (lokalni listener ili Actions) taj i odgovara.
+    Ako lokalni listener trenutno long-polluje, Actions dobije 409 i preskoči."""
+    token = config.get('telegram_token', '')
+    if not token:
+        return
+    allowed = get_allowed_chat_ids(config)
+    if not allowed:
+        logger.warning("⚠️  Nema dozvoljenih chat ID-ova — preskačem proveru komandi.")
+        return
+
+    updates = get_telegram_updates(token, timeout=0)  # timeout=0 → ne čekamo, uzmi šta je u redu
+    if not updates:
+        return
+
+    last_update_id = None
+    handled = 0
+    for upd in updates:
+        last_update_id = upd['update_id']
+        msg = upd.get('message') or upd.get('channel_post')
+        if not msg:
+            continue
+        chat_id = str(msg.get('chat', {}).get('id', ''))
+        text = (msg.get('text') or '').strip()
+        if chat_id not in allowed:
+            logger.warning(f"⚠️  Ignorišem poruku od nepoznatog chat_id: {chat_id}")
+            continue
+        m = TELEGRAM_CMD_RE.match(text)
+        if not m:
+            continue
+        logger.info(f"📩 [Actions] Komanda '{text}' od {chat_id}")
+        override_total = int(m.group(1)) * 1000 if m.group(1) else None
+        try:
+            handle_svi_command(config, chat_id, token, override_total, prefetched=prefetched)
+            handled += 1
+        except Exception as e:
+            logger.error(f"❌ Greška u handle_svi_command: {e}")
+
+    # Potvrdi Telegram-u da su ovi update-ovi obrađeni (da ih ne dobijemo ponovo)
+    if last_update_id is not None:
+        get_telegram_updates(token, offset=last_update_id + 1, timeout=0)
+        logger.info(f"✅ Obrađeno komandi: {handled} (potvrđeno do update_id={last_update_id})")
+
+
 def run_telegram_listener(config):
     """Beskonačna petlja: long-poll Telegram, odgovori na /svi i /svi<N> komande.
     Namenjeno za lokalno pokretanje (Task Scheduler), ne za GitHub Actions."""
@@ -869,9 +957,7 @@ def run_telegram_listener(config):
         logger.error("❌ Telegram token nije podešen — ne mogu da pokrenem listener.")
         return
 
-    allowed_chat_ids = {str(config.get('telegram_chat_id', ''))}
-    allowed_chat_ids.update(str(x) for x in config.get('telegram_extra_chat_ids', []))
-    allowed_chat_ids.discard('')
+    allowed_chat_ids = get_allowed_chat_ids(config)
 
     logger.info("🤖 Telegram listener pokrenut — komande: /svi, /svi<broj> (npr. /svi100 = do 100.000€)")
     logger.info(f"   Dozvoljeni chat ID-ovi: {', '.join(allowed_chat_ids) or '(nijedan — proveri config!)'}")
@@ -1001,6 +1087,15 @@ def main():
     logger.info(f"   Notifikacije poslate: {sent_total}")
 
     save_seen(seen)
+
+    # Odgovori na eventualne /svi komande poslate dok lokalni listener nije radio.
+    # Koristi oglase iz ovog run-a (prefetched) — bez ponovnog skrejpovanja.
+    # Greška ovde ne sme da obori ceo run, zato try/except.
+    try:
+        handle_pending_commands(config, prefetched=all_listings)
+    except Exception as e:
+        logger.error(f"❌ Greška pri obradi Telegram komandi: {e}")
+
     logger.info("✅ Scraping završen.\n")
 
 
