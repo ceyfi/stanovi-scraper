@@ -287,7 +287,10 @@ def scrape_halooglasi(config):
                 title = link.get_text(strip=True) or "Stan na prodaju"
 
                 price = None
-                price_el = item.select_one('.price-box-main, [class*="price-main"]')
+                # '.central-feature' je trenutna klasa za ukupnu cenu na halooglasi.com
+                # (19.7.2026: sajt promenio markup, stari '.price-box-main' vise ne pogadja ništa).
+                # Stari selektori ostaju kao fallback ako se sajt opet promeni.
+                price_el = item.select_one('.central-feature, .price-box-main, [class*="price-main"]')
                 if price_el:
                     price = parse_price(price_el.get_text())
 
@@ -376,7 +379,10 @@ def scrape_halooglasi_zemljiste(config):
                 title = link.get_text(strip=True) or "Zemljište na prodaju"
 
                 price = None
-                price_el = item.select_one('.price-box-main, [class*="price-main"]')
+                # '.central-feature' je trenutna klasa za ukupnu cenu na halooglasi.com
+                # (19.7.2026: sajt promenio markup, stari '.price-box-main' vise ne pogadja ništa).
+                # Stari selektori ostaju kao fallback ako se sajt opet promeni.
+                price_el = item.select_one('.central-feature, .price-box-main, [class*="price-main"]')
                 if price_el:
                     price = parse_price(price_el.get_text())
 
@@ -741,6 +747,171 @@ def scrape_nekretnine(config):
     return results
 
 # ============================================================
+# ZAJEDNIČKI SPISAK SCRAPERA + FILTER (koristi main, --debug i --listen)
+# ============================================================
+
+# Halo Oglasi (stanovi) radi lokalno ali GitHub Actions IP dobija 403,
+# zato je van SCRAPERS_ACTIONS. --debug i --listen (koji se pokreću lokalno)
+# koriste SCRAPERS_ALL i time ga uključuju.
+SCRAPERS_ALL = [
+    ('Halo Oglasi', scrape_halooglasi),
+    ('4zida.rs', scrape_4zida),
+    ('City Expert', scrape_cityexpert),
+    ('Nekretnine.rs', scrape_nekretnine),
+    ('Halo Zemljište', scrape_halooglasi_zemljiste),
+]
+SCRAPERS_ACTIONS = [s for s in SCRAPERS_ALL if s[0] != 'Halo Oglasi']
+
+
+def run_scrapers_collect(config, scrapers):
+    """Pokreni listu (naziv, funkcija) scrapera i skupi sve rezultate. Pad jednog ne ruši ostale."""
+    all_listings = []
+    for name, fn in scrapers:
+        try:
+            found = fn(config)
+            logger.info(f"✔ {name}: {len(found)} oglasa")
+            all_listings.extend(found)
+        except Exception as e:
+            logger.error(f"✘ {name} pao: {e}")
+    return all_listings
+
+
+def filter_match(listing, targets, max_ppm2, max_total):
+    """Da li oglas prolazi lokacijski + cenovni filter.
+    max_ppm2=None → cenovni cap po m² se ne primenjuje (koristi se za /sviN komandu).
+    Zemljišta su već filtrirana unutar scrapera (price_per_m2 kod njih je cena PO ARU,
+    ne po m² — zato se cenovni filteri za stanove ne primenjuju na njih ovde)."""
+    loc_ok = is_target_location(listing.get('location', ''), targets)
+    if listing.get('source') == 'Halo Zemljište':
+        price_ok = True
+        total_ok = True
+    else:
+        price_ok = max_ppm2 is None or is_good_price(listing.get('price_per_m2'), max_ppm2)
+        price_val = listing.get('price')
+        total_ok = max_total is None or (price_val is not None and price_val <= max_total)
+    return loc_ok and price_ok and total_ok
+
+
+# ============================================================
+# TELEGRAM KOMANDE (/svi, /svi<broj>) — na zahtev, ne čeka se seen.json
+# ============================================================
+
+TELEGRAM_CMD_RE = re.compile(r'^/svi(\d+)?\b')
+
+
+def get_telegram_updates(token, offset=None, timeout=30):
+    """Long-poll Telegram getUpdates. Vraća listu update objekata."""
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    params = {'timeout': timeout}
+    if offset is not None:
+        params['offset'] = offset
+    try:
+        r = requests.get(url, params=params, timeout=timeout + 10, verify=SSL_VERIFY,
+                         proxies={'http': '', 'https': ''})
+        r.raise_for_status()
+        return r.json().get('result', [])
+    except Exception as e:
+        logger.error(f"❌ Greška pri getUpdates: {e}")
+        return []
+
+
+def handle_svi_command(config, chat_id, telegram_token, override_total=None):
+    """/svi → svi trenutni matches po config filterima (bez seen.json ograničenja).
+    /svi<N> → isto, ali max ukupna cena = N*1000 €, bez ppm2 ograničenja (brzi pregled)."""
+    targets = config.get('target_locations', ['Beograd'])
+    if override_total is not None:
+        max_total = override_total
+        ppm2_cap = None
+    else:
+        max_total = config.get('max_total_price')
+        ppm2_cap = int(config.get('max_price_per_m2', 2000))
+
+    cena_txt = f" do {max_total:,.0f} €".replace(',', '.') if max_total else ""
+    send_telegram(telegram_token, chat_id, f"🔍 Tražim sve oglase{cena_txt}... (30-60s)")
+
+    all_listings = run_scrapers_collect(config, SCRAPERS_ALL)
+    matches = [l for l in all_listings if filter_match(l, targets, ppm2_cap, max_total)]
+
+    if not matches:
+        send_telegram(telegram_token, chat_id, "😕 Nema oglasa koji ispunjavaju kriterijume trenutno.")
+        return
+
+    matches.sort(key=lambda l: l.get('price') or float('inf'))
+
+    header = f"📋 Nađeno {len(matches)} oglasa{cena_txt}"
+    send_telegram(telegram_token, chat_id, header)
+    time.sleep(1)
+
+    # Kompaktna lista (ne pun format_message po oglasu — previše poruka za spam).
+    # Chunk-uje se da ne pređe Telegram limit od 4096 karaktera po poruci.
+    chunk = ""
+    for l in matches:
+        price = f"{l['price']:,.0f}€".replace(',', '.') if l.get('price') else '?'
+        is_land = l.get('source') == 'Halo Zemljište'
+        ppm2_val = l.get('price_per_m2')
+        ppm2 = f" ({ppm2_val:,.0f}€/{'ar' if is_land else 'm²'})".replace(',', '.') if ppm2_val else ''
+        title = (l.get('title') or '')[:45]
+        line = f"• <b>{price}</b>{ppm2} | {title} | {l.get('location', '')}\n{l.get('url', '')}\n"
+        if len(chunk) + len(line) > 3500:
+            send_telegram(telegram_token, chat_id, chunk)
+            time.sleep(1)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        send_telegram(telegram_token, chat_id, chunk)
+
+
+def run_telegram_listener(config):
+    """Beskonačna petlja: long-poll Telegram, odgovori na /svi i /svi<N> komande.
+    Namenjeno za lokalno pokretanje (Task Scheduler), ne za GitHub Actions."""
+    token = config.get('telegram_token', '')
+    if not token:
+        logger.error("❌ Telegram token nije podešen — ne mogu da pokrenem listener.")
+        return
+
+    allowed_chat_ids = {str(config.get('telegram_chat_id', ''))}
+    allowed_chat_ids.update(str(x) for x in config.get('telegram_extra_chat_ids', []))
+    allowed_chat_ids.discard('')
+
+    logger.info("🤖 Telegram listener pokrenut — komande: /svi, /svi<broj> (npr. /svi100 = do 100.000€)")
+    logger.info(f"   Dozvoljeni chat ID-ovi: {', '.join(allowed_chat_ids) or '(nijedan — proveri config!)'}")
+
+    offset = None
+    while True:
+        try:
+            updates = get_telegram_updates(token, offset=offset, timeout=30)
+            for upd in updates:
+                offset = upd['update_id'] + 1
+                msg = upd.get('message') or upd.get('channel_post')
+                if not msg:
+                    continue
+                chat_id = str(msg.get('chat', {}).get('id', ''))
+                text = (msg.get('text') or '').strip()
+
+                if chat_id not in allowed_chat_ids:
+                    logger.warning(f"⚠️  Ignorišem poruku od nepoznatog chat_id: {chat_id}")
+                    continue
+
+                m = TELEGRAM_CMD_RE.match(text)
+                if not m:
+                    continue
+
+                logger.info(f"📩 Komanda '{text}' od {chat_id}")
+                override_total = int(m.group(1)) * 1000 if m.group(1) else None
+                try:
+                    handle_svi_command(config, chat_id, token, override_total)
+                except Exception as e:
+                    logger.error(f"❌ Greška u handle_svi_command: {e}")
+                    send_telegram(token, chat_id, f"❌ Greška pri pretrazi: {e}")
+        except KeyboardInterrupt:
+            logger.info("🛑 Listener zaustavljen (Ctrl+C).")
+            break
+        except Exception as e:
+            logger.error(f"❌ Listener greška: {e}")
+            time.sleep(5)
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -792,20 +963,7 @@ def main():
 
         new_total += 1
 
-        loc_ok = is_target_location(listing.get('location', ''), targets)
-
-        # Zemljišta su već filtrirana unutar scrapera (po max_price_per_ar i
-        # max_total_price_zemljiste) — ne primenjuj filtere za stanove na njih,
-        # jer price_per_m2 kod zemljišta sadrži cenu PO ARU, ne po m².
-        if listing.get('source') == 'Halo Zemljište':
-            price_ok = True
-            total_ok = True
-        else:
-            price_ok = is_good_price(listing.get('price_per_m2'), max_ppm2)
-            price_val = listing.get('price')
-            total_ok = max_total is None or (price_val is not None and price_val <= max_total)
-
-        if loc_ok and price_ok and total_ok:
+        if filter_match(listing, targets, max_ppm2, max_total):
             # 'or 0' a ne default u .get(): ključ postoji sa vrednošću None
             # (npr. zemljište bez cene) → .get(key, 0) vraća None → crash na :.0f
             ppm2 = listing.get('price_per_m2') or 0
@@ -872,35 +1030,22 @@ if __name__ == '__main__':
         print("✅ seen.json je obrisan — sledeći run će poslati sve oglase koji prođu filter.")
         sys.exit(0)
 
+    if '--listen' in sys.argv:
+        config = load_config()
+        run_telegram_listener(config)
+        sys.exit(0)
+
     if '--debug' in sys.argv:
         config = load_config()
         max_ppm2 = int(config.get('max_price_per_m2', 1500))
+        max_total = config.get('max_total_price')
         targets = config.get('target_locations', ['Novi Beograd', 'Zemun', 'Ledine', 'Bezanija'])
-        scrapers = [
-            ('Halo Oglasi', scrape_halooglasi),
-            ('4zida.rs', scrape_4zida),
-            ('City Expert', scrape_cityexpert),
-            ('Nekretnine.rs', scrape_nekretnine),
-            ('Halo Zemljište', scrape_halooglasi_zemljiste),
-        ]
-        all_listings = []
-        for name, fn in scrapers:
-            try:
-                found = fn(config)
-                all_listings.extend(found)
-            except Exception as e:
-                print(f"✘ {name} pao: {e}")
+        all_listings = run_scrapers_collect(config, SCRAPERS_ALL)
 
         print(f"\n{'='*60}")
         print(f"Ukupno nađeno: {len(all_listings)} oglasa")
-        def debug_price_ok(l):
-            if l.get('source') == 'Halo Zemljište':
-                return True  # već filtrirano unutar scrapera
-            return is_good_price(l.get('price_per_m2'), max_ppm2)
 
-        matches = [l for l in all_listings if
-                   is_target_location(l.get('location', ''), targets) and
-                   debug_price_ok(l)]
+        matches = [l for l in all_listings if filter_match(l, targets, max_ppm2, max_total)]
         print(f"Prolazi filter (lokacija + cena ≤ {max_ppm2}€/m² za stanove): {len(matches)}")
         print(f"{'='*60}")
         for l in matches:
