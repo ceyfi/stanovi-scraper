@@ -31,6 +31,16 @@ BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / 'config.json'
 SEEN_FILE = BASE_DIR / 'seen.json'
 
+# Važi samo tokom života procesa. Lokalni Telegram listener radi dugo i može
+# više puta da pokrene scrapere, pa nema potrebe da svaki put ponovo probava
+# sve 4zida endpoint-e. Na GitHub Actions procesu se svakako radi samo jedan run.
+FOUR_ZIDA_URL_CANDIDATES = (
+    "https://api.4zida.rs/v6/search/apartments",
+    "https://api.4zida.rs/v6/search/apartments?for=sale",
+    "https://api.4zida.rs/v5/search/apartments",
+)
+_four_zida_working_url = None
+
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept-Language': 'sr-RS,sr;q=0.9,en;q=0.8',
@@ -196,6 +206,75 @@ def parse_area(text):
 def calc_ppm2(price, area):
     if price and area and area > 0:
         return round(price / area, 0)
+    return None
+
+
+def _numeric_candidate(value, minimum, maximum):
+    """Pretvori broj/string/nested API vrednost u broj unutar očekivanog opsega."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if minimum <= number <= maximum else None
+    if isinstance(value, str):
+        cleaned = re.sub(r'[^\d.,]', '', value.strip())
+        if not cleaned:
+            return None
+        if '.' in cleaned and ',' in cleaned:
+            # Podrži i 149.500,00 i 149,500.00 format.
+            decimal_sep = ',' if cleaned.rfind(',') > cleaned.rfind('.') else '.'
+            thousands_sep = '.' if decimal_sep == ',' else ','
+            cleaned = cleaned.replace(thousands_sep, '').replace(decimal_sep, '.')
+        else:
+            separator = '.' if '.' in cleaned else ',' if ',' in cleaned else None
+            if separator:
+                parts = cleaned.split(separator)
+                if len(parts) == 2 and len(parts[-1]) == 2:
+                    cleaned = '.'.join(parts)
+                else:
+                    cleaned = ''.join(parts)
+        try:
+            number = float(cleaned)
+            return number if minimum <= number <= maximum else None
+        except ValueError:
+            return None
+    if isinstance(value, dict):
+        for key in ('value', 'amount', 'price', 'raw', 'formatted', 'displayValue'):
+            number = _numeric_candidate(value.get(key), minimum, maximum)
+            if number is not None:
+                return number
+    return None
+
+
+def extract_nekretnine_price(item, real_estate, properties, area):
+    """Izvuci ukupnu cenu iz varijanti Nekretnine.rs payload-a.
+
+    Sajt ne šalje uvek ``realEstate.price.value``. Prvo proveravamo druga
+    eksplicitna polja ukupne cene, a tek zatim računamo ukupnu cenu iz jasno
+    označene cene po m². Namerno ne vadimo proizvoljne brojeve iz naslova.
+    """
+    total_price_fields = ('price', 'totalPrice', 'priceValue', 'askingPrice')
+    for container in (real_estate, item, properties):
+        if not isinstance(container, dict):
+            continue
+        for key in total_price_fields:
+            price = _numeric_candidate(container.get(key), 10_000, 10_000_000)
+            if price is not None:
+                return price
+
+    if not area:
+        return None
+
+    ppm2_fields = ('pricePerM2', 'pricePerSquareMeter', 'squareMeterPrice', 'priceM2')
+    for container in (real_estate, item, properties):
+        if not isinstance(container, dict):
+            continue
+        for key in ppm2_fields:
+            ppm2 = _numeric_candidate(container.get(key), 100, 100_000)
+            if ppm2 is not None:
+                total = ppm2 * area
+                if 10_000 <= total <= 10_000_000:
+                    return round(total, 2)
     return None
 
 _DIACRITICS_MAP = str.maketrans('čćšžđ', 'ccszd')
@@ -457,12 +536,14 @@ def scrape_4zida(config):
     results = []
     targets = config.get('target_locations', ['Novi Beograd', 'Zemun', 'Ledine', 'Bezanija'])
 
-    # Probaj različite URL formate — API menja šta prima
-    url_candidates = [
-        "https://api.4zida.rs/v6/search/apartments",
-        "https://api.4zida.rs/v6/search/apartments?for=sale",
-        "https://api.4zida.rs/v5/search/apartments",
-    ]
+    global _four_zida_working_url
+
+    # Keširani URL ide prvi. Ako prestane da radi, odmah se invalidira i u istom
+    # run-u probamo ostale poznate endpoint-e.
+    url_candidates = list(FOUR_ZIDA_URL_CANDIDATES)
+    if _four_zida_working_url in url_candidates:
+        url_candidates.remove(_four_zida_working_url)
+        url_candidates.insert(0, _four_zida_working_url)
 
     working_url = None
     first_page_data = None  # čuvamo odgovor iz probe da ne tražimo stranu 1 dva puta
@@ -474,12 +555,17 @@ def scrape_4zida(config):
                 'Origin': 'https://4zida.rs',
                 'Referer': 'https://4zida.rs/',
             })
-            if isinstance(test_data, dict) or isinstance(test_data, list):
+            # Ostatak scrapera očekuje baš objekat sa ``ads`` listom; generički
+            # JSON error objekat ili top-level lista nisu dokaz da endpoint radi.
+            if isinstance(test_data, dict) and isinstance(test_data.get('ads'), list):
                 working_url = candidate
+                _four_zida_working_url = candidate
                 first_page_data = test_data
                 logger.info(f"[4zida.rs] Radi URL: {candidate}")
                 break
         except Exception as e:
+            if candidate == _four_zida_working_url:
+                _four_zida_working_url = None
             logger.warning(f"[4zida.rs] Ne radi {candidate}: {e}")
 
     if not working_url:
@@ -562,6 +648,7 @@ def scrape_4zida(config):
 
         except Exception as e:
             logger.error(f"[4zida.rs] API greška strana {page}: {e}")
+            _four_zida_working_url = None
             break
 
         time.sleep(1)
@@ -720,8 +807,10 @@ def scrape_nekretnine(config):
                     seo = item.get('seo', {})
 
                     listing_id = f"nek_{re_data.get('id', '')}"
-                    price = re_data.get('price', {}).get('value')
-                    props = (re_data.get('properties') or [{}])[0]
+                    raw_props = re_data.get('properties') or {}
+                    props = raw_props[0] if isinstance(raw_props, list) and raw_props else raw_props
+                    if not isinstance(props, dict):
+                        props = {}
                     location = props.get('location', {})
 
                     # Lokacija: macrozone + microzone
@@ -738,6 +827,7 @@ def scrape_nekretnine(config):
                     surface_str = props.get('surface', '')
                     area = parse_area(surface_str)
 
+                    price = extract_nekretnine_price(item, re_data, props, area)
                     ppm2 = calc_ppm2(price, area)
                     full_url = seo.get('url', f"https://www.nekretnine.rs/oglasi/{re_data.get('id', '')}/")
                     title = seo.get('anchor', props.get('caption', f"Stan – {macrozone}"))
