@@ -755,9 +755,21 @@ def scrape_nekretnine(config):
     targets = config.get('target_locations', ['Novi Beograd', 'Zemun', 'Ledine', 'Bezanija'])
     session = requests.Session()
     session.trust_env = False
+    # Pun set zaglavlja kao pravi Chrome — od nov. 2026 sajt vraća 403 na
+    # "golu" requests sesiju (i lokalno, ne samo na Actions).
     session.headers.update({
         **HEADERS,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Sec-Ch-Ua': '"Chromium";v="141", "Not?A_Brand";v="8", "Google Chrome";v="141"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
     })
 
     # Scrape prvih 5 strana (125 oglasa) sortiranih po najnovijem
@@ -779,8 +791,16 @@ def scrape_nekretnine(config):
                 r = session.get(url, timeout=20, verify=SSL_VERIFY)
                 if r.status_code == 200 and r.text:
                     break
+                if r.status_code == 403:
+                    break  # blokada se ne rešava ponavljanjem — ne gubi vreme
                 logger.warning(f"[Nekretnine.rs] status {r.status_code} (pokušaj {attempt}/3), ponavljam...")
                 time.sleep(2 * attempt)
+
+            if r is not None and r.status_code == 403:
+                snippet = re.sub(r'\s+', ' ', r.text[:200])
+                logger.error(f"[Nekretnine.rs] 403 — sajt blokira scraper (anti-bot zaštita). "
+                             f"Početak odgovora: {snippet!r}")
+                break
 
             if r is None or not r.text:
                 logger.warning("[Nekretnine.rs] prazan odgovor posle 3 pokušaja")
@@ -885,6 +905,9 @@ def run_scrapers_collect(config, scrapers):
     return all_listings
 
 
+MIN_SANE_FLAT_PRICE = 10_000  # €; ispod ovoga oglas za stan smatramo greškom
+
+
 def filter_match(listing, targets, max_ppm2, max_total):
     """Da li oglas prolazi lokacijski + cenovni filter.
     max_ppm2=None → cenovni cap po m² se ne primenjuje (koristi se za /sviN komandu).
@@ -895,8 +918,13 @@ def filter_match(listing, targets, max_ppm2, max_total):
         price_ok = True
         total_ok = True
     else:
-        price_ok = max_ppm2 is None or is_good_price(listing.get('price_per_m2'), max_ppm2)
         price_val = listing.get('price')
+        # Cena stana ispod 10.000 € je skoro sigurno greška u oglasu (npr. 4zida
+        # "Humska 10, 4.500€, 46m²" = 98 €/m²) ili kirija upisana kao prodaja.
+        # Bez ovoga takvi oglasi prolaze filter jer je €/m² "jeftin".
+        if price_val is not None and price_val < MIN_SANE_FLAT_PRICE:
+            return False
+        price_ok = max_ppm2 is None or is_good_price(listing.get('price_per_m2'), max_ppm2)
         total_ok = max_total is None or (price_val is not None and price_val <= max_total)
     return loc_ok and price_ok and total_ok
 
@@ -1234,7 +1262,8 @@ if __name__ == '__main__':
         print(f"Prolazi filter (lokacija + cena ≤ {max_ppm2}€/m² za stanove): {len(matches)}")
         print(f"{'='*60}")
         for l in matches:
-            print(f"  [{l['source']}] {l['title']} | {l.get('price_per_m2') or 0:.0f}€/m² | {l['url']}")
+            unit = '€/ar' if l.get('source') == 'Halo Zemljište' else '€/m²'
+            print(f"  [{l['source']}] {l['title']} | {l.get('price_per_m2') or 0:.0f}{unit} | {l['url']}")
         if not matches:
             print("\nNema oglasa koji prolaze filter. Distribucija cena/m²:")
             loc_listings = [l for l in all_listings if is_target_location(l.get('location', ''), targets)]
