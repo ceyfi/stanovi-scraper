@@ -13,6 +13,30 @@ import time
 import logging
 import urllib.request
 import urllib.error
+import http.client
+
+
+# Python-ov http.client preskače samo "100 Continue", a svaki drugi 1xx odgovor
+# (npr. "103 Early Hints", koji Nekretnine.rs šalje pre pravog odgovora)
+# tretira kao konačan — pa requests vrati status 103 sa praznim telom.
+# Ovaj patch preskače informativne 1xx odgovore (osim 101) i čita pravi.
+_orig_read_status = http.client.HTTPResponse._read_status
+
+
+def _read_status_skip_1xx(self):
+    while True:
+        version, status, reason = _orig_read_status(self)
+        if 100 <= status < 200 and status != 101:
+            # odbaci zaglavlja informativnog odgovora (do prazne linije)
+            while True:
+                line = self.fp.readline(65537)
+                if line in (b'\r\n', b'\n', b''):
+                    break
+            continue
+        return version, status, reason
+
+
+http.client.HTTPResponse._read_status = _read_status_skip_1xx
 from datetime import datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
@@ -610,6 +634,10 @@ def scrape_4zida(config):
                     # VAŽNO: koristi is_target_location() (normalizuje dijakritike),
                     # ne sirovi .lower() — inače 'Bežanija' iz API-ja ne matchuje
                     # 'Bezanija' iz config-a i oglas tiho nestane pre main() filtera.
+                    # 4zida API vraća celu Srbiju — i Novi Sad ima "Stari Grad",
+                    # pa bez provere grada stižu oglasi iz Novog Sada.
+                    if 'beograd' not in normalize_text(location_str):
+                        continue
                     if not is_target_location(location_str, targets):
                         continue
 
