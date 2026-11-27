@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Lokalni rad (Task Scheduler) — ne ide na GitHub
+seen_local.json
+scraper_log.txt
+provera_rezultat.txt

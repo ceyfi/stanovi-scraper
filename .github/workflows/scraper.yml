@@ -1,14 +1,17 @@
 name: Scraper Stanovi Beograd
 
 on:
-  schedule:
-    # Svaki sat od 08:00 do 00:00 po beogradskom vremenu (UTC+2 leti)
-    # UTC: 06:00–22:00  →  Beograd: 08:00–00:00
-    # Minut 17, ne 0: GitHub najčešće preskače zakazane runove u pun sat
-    # (najveće opterećenje). Sa :00 je radilo samo 2-3 runa dnevno umesto 17.
-    - cron: '17 6-22 * * *'
+  # SCHEDULE JE ISKLJUČEN od 27.11.2026.
+  # Scraper sada radi lokalno svakog sata preko Windows Task Schedulera
+  # (zadatak "Stanovi scraper", vidi podesi_automatski.bat), jer Halo Oglasi
+  # i Nekretnine.rs vraćaju 403 sa GitHub Actions IP adresa. Da je schedule
+  # ostao uključen, 4zida i City Expert oglasi bi stizali duplo — i sa
+  # Actions-a i lokalno.
+  #
+  # schedule:
+  #   - cron: '17 6-22 * * *'
 
-  # Omogućava ručno pokretanje iz GitHub-a (Actions tab → Run workflow)
+  # Ručno pokretanje iz GitHub-a (Actions tab → Run workflow) ostaje.
   workflow_dispatch:
 
 concurrency:

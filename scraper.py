@@ -112,11 +112,12 @@ def load_config():
 # oglasi koji su skinuti sa sajta pre više od N dana.
 SEEN_MAX_AGE_DAYS = 30
 
-def load_seen():
+def load_seen(seen_file=None):
     """seen.json format: {"listing_id": unix_timestamp}. Stari format (lista) se migrira."""
-    if SEEN_FILE.exists():
+    seen_file = seen_file or SEEN_FILE
+    if seen_file.exists():
         try:
-            with open(SEEN_FILE, encoding='utf-8') as f:
+            with open(seen_file, encoding='utf-8') as f:
                 data = json.load(f)
         except Exception:
             return {}
@@ -126,13 +127,14 @@ def load_seen():
         return {str(k): float(v) for k, v in data.items()}
     return {}
 
-def save_seen(seen):
+def save_seen(seen, seen_file=None):
+    seen_file = seen_file or SEEN_FILE
     cutoff = time.time() - SEEN_MAX_AGE_DAYS * 86400
     pruned = {k: v for k, v in seen.items() if v >= cutoff}
     removed = len(seen) - len(pruned)
     if removed:
         logger.info(f"🧹 seen.json: obrisano {removed} unosa starijih od {SEEN_MAX_AGE_DAYS} dana")
-    with open(SEEN_FILE, 'w', encoding='utf-8') as f:
+    with open(seen_file, 'w', encoding='utf-8') as f:
         json.dump(pruned, f, indent=2, sort_keys=True)
 
 # ============================================================
@@ -804,6 +806,11 @@ def scrape_nekretnine(config):
     MAX_PAGES = 5
 
     for page in range(1, MAX_PAGES + 1):
+        # DataDome postavi cookie na prvi odgovor; ako ga vratimo na sledećem
+        # zahtevu, očekuje JS-rešen challenge i vrati 403. Bez cookieja svaki
+        # zahtev prolazi kao "prvi" i dobijamo 200.
+        session.cookies.clear()
+
         if page == 1:
             url = "https://www.nekretnine.rs/prodaja-stanova/beograd/"
         else:
@@ -816,6 +823,7 @@ def scrape_nekretnine(config):
             # sledeći pokušaj obično vrati pravi 200 sa sadržajem.
             r = None
             for attempt in range(1, 4):
+                session.cookies.clear()
                 r = session.get(url, timeout=20, verify=SSL_VERIFY)
                 if r.status_code == 200 and r.text:
                     break
@@ -920,17 +928,78 @@ SCRAPERS_ALL = [
 SCRAPERS_ACTIONS = [s for s in SCRAPERS_ALL if s[0] != 'Halo Oglasi']
 
 
-def run_scrapers_collect(config, scrapers):
-    """Pokreni listu (naziv, funkcija) scrapera i skupi sve rezultate. Pad jednog ne ruši ostale."""
+class _ErrorCollector(logging.Handler):
+    """Hvata ERROR poruke dok radi jedan scraper (scraperi sami hvataju
+    izuzetke i vrate [], pa bez ovoga ne razlikujemo '0 oglasa' od '403')."""
+
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def run_scrapers_collect(config, scrapers, stats=None):
+    """Pokreni listu (naziv, funkcija) scrapera i skupi sve rezultate. Pad jednog ne ruši ostale.
+    Ako je prosleđen dict `stats`, upisuje stats[naziv] = (broj_oglasa, [greške])."""
     all_listings = []
     for name, fn in scrapers:
+        collector = _ErrorCollector()
+        logger.addHandler(collector)
+        found = []
         try:
             found = fn(config)
             logger.info(f"✔ {name}: {len(found)} oglasa")
             all_listings.extend(found)
         except Exception as e:
             logger.error(f"✘ {name} pao: {e}")
+        finally:
+            logger.removeHandler(collector)
+        if stats is not None:
+            stats[name] = (len(found), collector.messages)
     return all_listings
+
+
+def run_provera(config):
+    """--provera: pokreni sve scrapere jednom, ispiši da li svaki sajt radi
+    i pošalji isti izveštaj na Telegram. Ne šalje oglase i ne dira seen fajlove."""
+    stats = {}
+    run_scrapers_collect(config, SCRAPERS_ALL, stats)
+
+    lines = []
+    all_ok = True
+    for name, (count, errors) in stats.items():
+        if errors:
+            all_ok = False
+            err = errors[0]
+            if '403' in err:
+                reason = '403 — sajt blokira zahtev'
+            else:
+                reason = err[:150]
+            lines.append(f"❌ {name}: NE RADI ({reason})")
+        elif count == 0:
+            all_ok = False
+            lines.append(f"⚠️ {name}: 0 oglasa (bez greške — sumnjivo, proveri)")
+        else:
+            lines.append(f"✅ {name}: {count} oglasa")
+
+    verdict = ("✅ SVE RADI — možeš da pokreneš podesi_automatski.bat"
+               if all_ok else "❌ NEŠTO NE RADI — ne pokreći još automatsko, pošalji ovo Claudeu")
+    report = "🔎 Provera scrapera sa ovog računara\n\n" + "\n".join(lines) + "\n\n" + verdict
+
+    print("\n" + "=" * 60)
+    print(report)
+    print("=" * 60)
+
+    token = config.get('telegram_token', '')
+    chat_id = config.get('telegram_chat_id', '')
+    if token and chat_id:
+        ok = send_telegram(token, chat_id, report)
+        print("📨 Izveštaj poslat na Telegram." if ok else "❌ Telegram slanje NIJE uspelo — proveri token/chat ID u config.json!")
+    else:
+        print("❌ Telegram token ili chat ID nisu podešeni u config.json — notifikacije neće stizati!")
+    return all_ok
 
 
 MIN_SANE_FLAT_PRICE = 10_000  # €; ispod ovoga oglas za stan smatramo greškom
@@ -1147,14 +1216,27 @@ def run_telegram_listener(config):
 # MAIN
 # ============================================================
 
-def main():
+# Lokalni (Task Scheduler) run koristi poseban seen fajl: seen.json je u gitu
+# i menja ga GitHub Actions, pa bi deljenje pravilo git konflikte.
+SEEN_LOCAL_FILE = BASE_DIR / 'seen_local.json'
+LOCAL_LOG_FILE = BASE_DIR / 'scraper_log.txt'
+
+
+def main(scrapers=None, seen_file=None):
+    scrapers = scrapers or SCRAPERS_ACTIONS
+    seen_file = seen_file or SEEN_FILE
     logger.info("=" * 50)
     logger.info("🔍 Pokretanje scrapera za stanove")
     logger.info(f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     logger.info("=" * 50)
 
     config = load_config()
-    seen = load_seen()
+    # Prvi run sa novim seen fajlom je "tih": samo zapamti sve postojeće oglase,
+    # inače bi odjednom stigle desetine notifikacija za stare oglase.
+    first_run = not seen_file.exists()
+    seen = load_seen(seen_file)
+    if first_run:
+        logger.info(f"🆕 {seen_file.name} ne postoji — prvi run je tih (samo pamti postojeće oglase)")
 
     telegram_token = config.get('telegram_token', '')
     telegram_chat_id = config.get('telegram_chat_id', '')
@@ -1171,7 +1253,7 @@ def main():
     logger.info(f"💶 Max cena/m²: {max_ppm2} €")
     logger.info(f"👁️  Već viđeno: {len(seen)} oglasa")
 
-    all_listings = run_scrapers_collect(config, SCRAPERS_ACTIONS)
+    all_listings = run_scrapers_collect(config, scrapers)
 
     logger.info(f"\n📦 Ukupno: {len(all_listings)} oglasa")
 
@@ -1194,6 +1276,10 @@ def main():
             continue
 
         new_total += 1
+
+        if first_run:
+            seen[lid] = time.time()
+            continue
 
         if filter_match(listing, targets, max_ppm2, max_total):
             # 'or 0' a ne default u .get(): ključ postoji sa vrednošću None
@@ -1232,7 +1318,7 @@ def main():
     logger.info(f"   Novi oglasi: {new_total}")
     logger.info(f"   Notifikacije poslate: {sent_total}")
 
-    save_seen(seen)
+    save_seen(seen, seen_file)
 
     # Odgovori na eventualne /svi komande poslate dok lokalni listener nije radio.
     # Koristi oglase iz ovog run-a (prefetched) — bez ponovnog skrejpovanja.
@@ -1249,6 +1335,12 @@ if __name__ == '__main__':
     import sys
 
     # Fix za Windows konzolu koja ne podržava UTF-8 po defaultu
+    # pythonw (Task Scheduler, bez prozora) nema konzolu: stdout/stderr su None
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+
     if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     if sys.stderr.encoding and sys.stderr.encoding.lower() not in ('utf-8', 'utf8'):
@@ -1269,6 +1361,24 @@ if __name__ == '__main__':
     if '--clear-seen' in sys.argv:
         save_seen({})
         print("✅ seen.json je obrisan — sledeći run će poslati sve oglase koji prođu filter.")
+        sys.exit(0)
+
+    if '--provera' in sys.argv:
+        ok = run_provera(load_config())
+        sys.exit(0 if ok else 1)
+
+    if '--local' in sys.argv:
+        # Lokalni automatski run (Task Scheduler, svaki sat): svi sajtovi,
+        # sopstveni seen fajl, log u scraper_log.txt (max ~2 MB).
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(LOCAL_LOG_FILE, maxBytes=1_000_000, backupCount=1, encoding='utf-8')
+        fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(fh)
+        try:
+            main(scrapers=SCRAPERS_ALL, seen_file=SEEN_LOCAL_FILE)
+        except Exception:
+            logger.exception("❌ Lokalni run pao")
+            sys.exit(1)
         sys.exit(0)
 
     if '--listen' in sys.argv:
